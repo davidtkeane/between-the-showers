@@ -16,7 +16,7 @@ Also watches the guinea pig hutch against sourced welfare thresholds — docs/WE
   ./weather.py --puck       push to the RangerPuck
   ./weather.py --watch      refresh every 10 min, push to the puck
 """
-import sys, os, json, time, subprocess, urllib.request, xml.etree.ElementTree as ET
+import sys, os, json, time, subprocess, urllib.request, urllib.parse, xml.etree.ElementTree as ET
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
@@ -46,6 +46,83 @@ def fetch_json(url, timeout=12):
     try:
         with urllib.request.urlopen(url, timeout=timeout) as r: return json.load(r)
     except Exception: return None
+
+def sun_times(lat, lon, when=None):
+    """Sunrise and sunset in UTC — simplified NOAA algorithm, no dependencies.
+
+    Needed because "sunny at 3am" is not a useful thing to tell anybody. Accurate
+    to a couple of minutes, which is plenty for "is it worth going outside".
+    """
+    import math
+    d = (when or datetime.now(timezone.utc)).date()
+    n = d.toordinal() - datetime(2000, 1, 1).date().toordinal() + 0.0008
+    J = n - lon / 360.0
+    M = (357.5291 + 0.98560028 * J) % 360
+    Cc = 1.9148*math.sin(math.radians(M)) + 0.02*math.sin(math.radians(2*M)) \
+         + 0.0003*math.sin(math.radians(3*M))
+    L = (M + Cc + 180 + 102.9372) % 360
+    Jt = 2451545.0 + J + 0.0053*math.sin(math.radians(M)) - 0.0069*math.sin(math.radians(2*L))
+    dec = math.asin(math.sin(math.radians(L)) * math.sin(math.radians(23.44)))
+    try:
+        w = math.acos((math.sin(math.radians(-0.833)) - math.sin(math.radians(lat))*math.sin(dec))
+                      / (math.cos(math.radians(lat))*math.cos(dec)))
+    except ValueError:
+        return None, None                     # polar day or night
+    rise = Jt - math.degrees(w)/360.0
+    setj = Jt + math.degrees(w)/360.0
+    to_dt = lambda j: datetime(2000,1,1,12,tzinfo=timezone.utc) + timedelta(days=j-2451545.0)
+    return to_dt(rise), to_dt(setj)
+
+def sun_windows(rows, max_cloud=45, min_len=2):
+    """Runs of bright daylight hours — the other half of the Irish question.
+
+    Knowing when the sun is coming matters as much as knowing when the rain is,
+    and no weather app tells you. Uses Met Éireann's cloudiness percentage, and
+    only counts hours between sunrise and sunset.
+    """
+    if not rows: return []
+    rise, set_ = sun_times(LAT, LON)
+    if not rise: return []
+    out, cur = [], []
+    for r in rows:
+        day = rise.time() <= r["t"].time() <= set_.time() if rise.date() == r["t"].date() \
+              else 6 <= r["t"].astimezone().hour <= 20     # crude for later days
+        bright = day and r.get("cloudiness", 100) <= max_cloud and not r["wet"]
+        cont = (not cur) or (r["t"] - cur[-1]["t"] == timedelta(hours=1))
+        if bright and cont: cur.append(r)
+        else:
+            if len(cur) >= min_len: out.append(cur)
+            cur = [r] if bright else []
+    if len(cur) >= min_len: out.append(cur)
+    return out
+
+def rain_minutes():
+    """Minute-by-minute rain for the next hour — the 5-minute warning.
+
+    OPTIONAL. Met Éireann's forecast is hourly and cannot do this, so it uses
+    OpenWeather One Call 3.0, which needs a key. Without one this returns None
+    and everything else still works: the core tool stays keyless.
+    Returns (minutes_until_rain, minutes_until_it_stops) or None.
+    """
+    key = _env("OPENWEATHER_API_KEY", "")
+    if not key: return None
+    try:
+        q = urllib.parse.urlencode({"lat": LAT, "lon": LON, "units": "metric",
+                                    "exclude": "daily,alerts", "appid": key})
+        with urllib.request.urlopen(
+                f"https://api.openweathermap.org/data/3.0/onecall?{q}", timeout=12) as r:
+            d = json.load(r)
+    except Exception:
+        return None
+    mins = d.get("minutely") or []
+    if not mins: return None
+    wet = [i for i, m in enumerate(mins) if m.get("precipitation", 0) > 0]
+    if not wet:
+        return ("dry", len(mins))
+    start = wet[0]
+    stop = next((i for i in range(start, len(mins))
+                 if mins[i].get("precipitation", 0) == 0), len(mins))
+    return ("rain", start, stop)
 
 def warnings_rss():
     """Met Éireann's OFFICIAL warnings feed.
@@ -233,6 +310,39 @@ def report(push=False, gaps_only=False):
                 col = {"Yellow": C['y'], "Orange": C['m'], "Red": C['r']}.get(w["level"], "")
                 print(f"  {col}⚠️  {w['level']}: {w.get('headline','')}{C['N']}")
 
+    # ---- the next hour, minute by minute (optional, needs a key) ----
+    # OpenWeather's minutely feed disagreed with Met Éireann on 2026-09-12 — it
+    # reported "raining now" on a dry evening. Met Éireann is the national service
+    # and the primary source here, so the minute feed is only allowed to SHOUT when
+    # the hourly forecast agrees rain is plausible. Otherwise it is shown as an
+    # unconfirmed second opinion. Same principle as amber on the puck: a warning
+    # that cries wolf trains you to ignore it.
+    rm = rain_minutes()
+    met_says_possible = now["prob"] is not None and now["prob"] >= 15
+    if rm and not gaps_only:
+        if rm[0] == "rain":
+            start, stop = rm[1], rm[2]
+            dur = stop - start
+            if not met_says_possible:
+                print(f"\n  {C['d']}· OpenWeather's minute feed says rain"
+                      f"{' now' if start == 0 else f' in {start}m'}, but Met Éireann has"
+                      f" it at {now['prob']:.0f}% — treating as unconfirmed.{C['N']}")
+                to_puck_later = None
+            elif start == 0:
+                print(f"\n  {C['b']}{C['B']}🌧️  RAINING NOW{C['N']}"
+                      f"  {C['d']}eases in about {stop} min{C['N']}")
+                to_puck_later = ("RAIN", "raining now", f"eases {stop}m")
+            else:
+                urgency = C['r'] if start <= 10 else C['y'] if start <= 25 else C['d']
+                print(f"\n  {urgency}{C['B']}🌧️  RAIN IN {start} MINUTES{C['N']}"
+                      f"  {C['d']}lasting about {dur} min — get the washing in{C['N']}")
+                to_puck_later = ("RAIN", f"rain in {start}m", f"lasts ~{dur}m")
+        else:
+            print(f"\n  {C['g']}☀️  no rain in the next {rm[1]} minutes{C['N']}")
+            to_puck_later = None
+    else:
+        to_puck_later = None
+
     # ---- the bit that matters: when can you go out ----
     print(f"\n{C['B']}{C['g']}  ── dry windows ──{C['N']}")
     if not gaps:
@@ -247,6 +357,33 @@ def report(push=False, gaps_only=False):
         note = " (to end of forecast)" if g[-1] is rows[-1] else ""
         print(f"   {C['g']}▸{C['N']} {when:>9} → {b.strftime(endf):<9} "
               f"{C['B']}{hrs}h{C['N']}  {C['d']}{min(temps):.0f}–{max(temps):.0f}°C{note}{C['N']}")
+
+    suns = sun_windows(rows)
+    print(f"\n{C['B']}{C['y']}  ── sunshine ──{C['N']}")
+    rise, set_ = sun_times(LAT, LON)
+    if rise:
+        nowt = datetime.now(timezone.utc)
+        line = (f"   {C['d']}sunrise {rise.astimezone().strftime('%H:%M')}"
+                f" · sunset {set_.astimezone().strftime('%H:%M')}")
+        # a countdown to whichever comes next — golden hour is worth catching
+        for label, when in (("sunrise", rise), ("sunset", set_)):
+            mins = int((when - nowt).total_seconds() // 60)
+            if 0 < mins <= 90:
+                col = C['y'] if mins <= 30 else C['d']
+                line = (f"   {col}{'🌅' if label=='sunrise' else '🌇'} {label} in {mins} min"
+                        f"{C['N']}{C['d']}  ·  {'sunset' if label=='sunrise' else 'sunrise'} "
+                        f"{(set_ if label=='sunrise' else rise).astimezone().strftime('%H:%M')}")
+                break
+        print(line + C['N'])
+    if not suns:
+        print(f"   {C['d']}no bright spell of 2h+ forecast. Ireland.{C['N']}")
+    for g in suns[:4]:
+        a = g[0]["t"].astimezone(); b = g[-1]["t"].astimezone() + timedelta(hours=1)
+        cl = sum(r.get("cloudiness", 0) for r in g) / len(g)
+        endf = "%H:%M" if b.date() == a.date() else "%a %H:%M"
+        when = "now" if g[0] is rows[0] else a.strftime("%a %H:%M")
+        print(f"   {C['y']}☀{C['N']} {when:>9} → {b.strftime(endf):<9} "
+              f"{C['B']}{len(g)}h{C['N']}  {C['d']}{cl:.0f}% cloud{C['N']}")
 
     if gaps_only: return
 
@@ -278,6 +415,11 @@ def report(push=False, gaps_only=False):
             # the pigs outrank the weather — this is the one that can do harm
             to_puck("PIGS", f"{t:.0f}C {'TOO HOT' if t >= GP_HOT else 'TOO COLD'}",
                     "check the hutch")
+        elif to_puck_later:
+            to_puck(*to_puck_later)
+        elif suns and suns[0][0] is rows[0]:
+            b = suns[0][-1]["t"].astimezone() + timedelta(hours=1)
+            to_puck("SUN", f"sunny {len(suns[0])}h", f"{t:.0f}C til {b.strftime('%H:%M')}")
         elif gaps and gaps[0][0] is rows[0]:
             b = gaps[0][-1]["t"].astimezone() + timedelta(hours=1)
             hrs = len(gaps[0])
