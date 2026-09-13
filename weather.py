@@ -253,6 +253,25 @@ def study_score(temp, humidity, pressure=None):
                "open a window first")
     return score, verdict, notes
 
+def to_puck_weather(temp, cond, rain, pigs, place):
+    """Push the ambient weather screen. NOT a state — weather is not urgent and
+    should not compete with an agent for the display. It takes its turn in the
+    board's ambient rotation alongside the planes and the fleet."""
+    import urllib.request
+    cache = Path.home() / ".ranger-memory/config/rangerpuck.ip"
+    host = cache.read_text().strip() if cache.exists() else "rangerpuck.local"
+    body = json.dumps({"temp": temp, "cond": cond, "rain": rain,
+                       "pigs": pigs, "place": place}).encode()
+    for h in (host, "rangerpuck.local"):
+        try:
+            req = urllib.request.Request(f"http://{h}/weather", data=body,
+                                         headers={"Content-Type": "application/json"})
+            urllib.request.urlopen(req, timeout=3).read()
+            return True
+        except Exception:
+            continue
+    return False
+
 def to_puck(state, l1, l2):
     """Optional ESP32 display. Never blocks, never raises, no shell."""
     if not PUCK.exists(): return
@@ -297,18 +316,19 @@ def report(push=False, gaps_only=False):
         print(f"  {C['B']}desk{C['N']} {col}{bar}{C['N']} {sc}/10  {C['d']}{verdict}"
               f"{(' — ' + ', '.join(notes)) if notes else ''}{C['N']}")
 
-        # official warnings for Dublin
-        if warn:
-            # marine warnings (gales, small craft) are irrelevant 10km inland — skip them
-            cats = [c for k, c in warn.get("warnings", {}).items()
-                    if isinstance(c, list) and k != "marine"]
-            live = [w for cat in cats for w in cat
-                    if isinstance(w, dict) and w.get("level") in ("Yellow","Orange","Red")
-                    and (not w.get("regions") or "EI06" in w.get("regions", [])
-                         or any("Dublin" in str(r) for r in w.get("regions", [])))]
-            for w in live[:3]:
-                col = {"Yellow": C['y'], "Orange": C['m'], "Red": C['r']}.get(w["level"], "")
-                print(f"  {col}⚠️  {w['level']}: {w.get('headline','')}{C['N']}")
+        # official warnings, worst first
+        #
+        # warnings_rss() returns a LIST. This block consumed the old prodapi
+        # DICT shape and raised AttributeError on ANY live warning — i.e. on
+        # exactly the cold or stormy days when the guinea pig alert matters,
+        # and the scheduled job swallowed the traceback into /dev/null. The
+        # licence-compliance refactor changed the producer and left the consumer.
+        #
+        # Met Éireann's licence REQUIRES current warnings be shown unaltered,
+        # so they are already sorted worst-first before any truncation.
+        for w in (warn or [])[:4]:
+            col = {"Yellow": C['y'], "Orange": C['m'], "Red": C['r']}.get(w.get("level"), "")
+            print(f"  {col}⚠️  {w.get('headline','')}{C['N']}")
 
     # ---- the next hour, minute by minute (optional, needs a key) ----
     # OpenWeather's minutely feed disagreed with Met Éireann on 2026-09-12 — it
@@ -409,25 +429,30 @@ def report(push=False, gaps_only=False):
     print(f"{C['d']}  Data: Copyright Met Éireann (met.ie), CC BY 4.0. Modified. No liability accepted.{C['N']}")
 
     if push:
+        # the ambient weather screen — always, regardless of state
+        sev_w, label_w, _ = gp_state(now["temperature"])
+        pigline = {"OK": "pigs comfy", "WARN": f"pigs {label_w.split('m')[-1].strip() or 'watch'}",
+                   "DANGER": "PIGS: " + ("TOO HOT" if now["temperature"] >= GP_HOT else "TOO COLD")}[sev_w]
+        import re as _re
+        pigline = _re.sub(r'\x1b\[[0-9;]*m', '', pigline)
+        to_puck_weather(f"{now['temperature']:.0f}C",
+                        (now.get("symbol") or "").replace("_", " ")[:12] or
+                        ("rain" if now["prob"] and now["prob"] >= 40 else "dry"),
+                        f"rain {now['prob']:.0f}%" if now["prob"] is not None else "",
+                        pigline, _env("PLACE", "weather"))
+
+        # ONLY the welfare alert becomes a STATE. Weather already has its own
+        # ambient screen (pushed above), and sending DRY/SUN/RAIN as states too
+        # meant the rotation showed weather TWICE — once as the proper screen and
+        # once as a state card. Two mechanisms doing one job.
+        #
+        # PIGS is different: it is an alert, not information. Cold enough to hurt
+        # an animal should interrupt, not wait its turn.
         t = now["temperature"]
         sev, _, _ = gp_state(t)
         if sev == "DANGER":
-            # the pigs outrank the weather — this is the one that can do harm
             to_puck("PIGS", f"{t:.0f}C {'TOO HOT' if t >= GP_HOT else 'TOO COLD'}",
                     "check the hutch")
-        elif to_puck_later:
-            to_puck(*to_puck_later)
-        elif suns and suns[0][0] is rows[0]:
-            b = suns[0][-1]["t"].astimezone() + timedelta(hours=1)
-            to_puck("SUN", f"sunny {len(suns[0])}h", f"{t:.0f}C til {b.strftime('%H:%M')}")
-        elif gaps and gaps[0][0] is rows[0]:
-            b = gaps[0][-1]["t"].astimezone() + timedelta(hours=1)
-            hrs = len(gaps[0])
-            label = f"dry {hrs}h" if hrs < 24 else "dry all day"
-            to_puck("DRY", label, f"{t:.0f}C til {b.strftime('%H:%M')}")
-        else:
-            nxt = gaps[0][0]["t"].astimezone().strftime("%H:%M") if gaps else "--"
-            to_puck("RAIN", f"dry at {nxt}", f"{t:.0f}C  {now['prob']:.0f}% now")
     print()
 
 if __name__ == "__main__":
