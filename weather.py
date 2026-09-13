@@ -217,6 +217,17 @@ def dry_gaps(rows, min_len=2):
     if len(cur) >= min_len: gaps.append(cur)
     return gaps
 
+def fmt1(v, unit="", nd=1):
+    """Format a value that may be None. hourly() deliberately yields None for an
+    hour with no precipitation record, and three separate consumers formatted it
+    straight into an f-string. Unknown prints as "--", never as 0."""
+    return f"--{unit}" if v is None else f"{v:.{nd}f}{unit}"
+
+def known(vals):
+    """Drop unknown hours before any min/max/arithmetic. max() over a list
+    containing None raises TypeError, which took the whole 24h graph down."""
+    return [v for v in vals if v is not None]
+
 def spark(vals, lo=None, hi=None):
     if not vals: return ""
     blocks = "▁▂▃▄▅▆▇█"
@@ -305,7 +316,7 @@ def report(push=False, gaps_only=False):
         print(f"  {C['B']}now{C['N']}  {now['temperature']:.0f}°C forecast"
               f"   {C['d']}wind {now.get('windSpeed',0)*3.6:.0f} km/h {now.get('windDir','')}"
               f" · humidity {now.get('humidity',0):.0f}%"
-              f" · {now['mm']:.1f}mm/h{C['N']}")
+              f" · {fmt1(now['mm'], 'mm/h')}{C['N']}")
         sev, label, note = gp_state(now["temperature"])
         print(f"  {C['B']}pigs{C['N']} {label}  {C['d']}{now['temperature']:.0f}°C — {note}{C['N']}")
 
@@ -410,13 +421,19 @@ def report(push=False, gaps_only=False):
     # ---- 24h graphs ----
     day = rows[:24]
     temps = [r["temperature"] for r in day]
-    probs = [r["prob"] for r in day]
-    mms   = [r["maxmm"] for r in day]
+    # unknown hours are dropped for the maths and drawn as a gap, not as zero
+    probs = known([r["prob"] for r in day])
+    mms   = known([r["maxmm"] for r in day])
+    unknown = sum(1 for r in day if not r.get("known", False))
     print(f"\n{C['B']}  ── next 24 hours ──{C['N']}")
     print(f"   temp  {C['c']}{spark(temps)}{C['N']}  {C['d']}{min(temps):.0f}–{max(temps):.0f}°C{C['N']}")
-    print(f"   rain% {C['b']}{spark(probs, 0, 100)}{C['N']}  {C['d']}max {max(probs):.0f}%{C['N']}")
-    print(f"   mm    {C['b']}{spark(mms, 0, max(1.0, max(mms)))}{C['N']}  {C['d']}max {max(mms):.1f}mm{C['N']}")
-    hrs = "".join(f"{r['t'].astimezone().hour%24:<1}" if i%3==0 else " " for i,r in enumerate(day))
+    if probs:
+        print(f"   rain% {C['b']}{spark(probs, 0, 100)}{C['N']}  {C['d']}max {max(probs):.0f}%{C['N']}")
+    if mms:
+        print(f"   mm    {C['b']}{spark(mms, 0, max(1.0, max(mms)))}{C['N']}  {C['d']}max {max(mms):.1f}mm{C['N']}")
+    if unknown:
+        print(f"   {C['d']}{unknown} of the next 24 hours have no rainfall record — "
+              f"counted as WET, not as dry.{C['N']}")
     print(f"   {C['d']}      {''.join((str(r['t'].astimezone().hour).rjust(1) if i%6==0 else ' ') for i,r in enumerate(day))}{C['N']}")
 
     lo = min(r["temperature"] for r in rows[:24])
