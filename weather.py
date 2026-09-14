@@ -555,22 +555,30 @@ def print_pig_run(run_min=45):
 
 
 def pig_push(run_min=45):
-    """Compute the pig-run status and push the matching state to the puck. One-shot,
-    called by launchd every few minutes. GO=green, WAIT=red, SOON=pulsing red."""
+    """Compute the pig-run status and push it to the puck.
+    GO/WAIT -> /pig (a rotating AMBIENT screen, always visible in the cycle).
+    SOON    -> /state (INTERRUPTS + pulses — the can't-miss rain-imminent flash).
+    Called by launchd every few minutes."""
     s = pig_run(run_min)
-    if s["status"] == "GO":
-        st = "PIGGO"
-    elif s.get("dry_left") is not None and 0 < s["dry_left"] <= 10:
-        st = "PIGSOON"                       # dry now, rain within 10 min — the flash
-    else:
-        st = "PIGWAIT"
-    l1 = s["head"].replace("GO \u00b7 ", "").replace("WAIT \u00b7 ", "")[:14]
-    l2 = (s["sub"] or "")[:20]
-    send = str(Path.home() / "esp32-projects/1-ranger-puck/tools/send.sh")
-    if os.path.exists(send):
-        env = dict(os.environ, PUCK_WHO="PIGS")
-        subprocess.Popen([send, st, l1, l2], env=env,
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    soon = (s["status"] != "WAIT-only") and s.get("dry_left") is not None and 0 < s["dry_left"] <= 10
+    st = "PIGGO" if s["status"] == "GO" else "PIGWAIT"
+    if soon: st = "PIGSOON"
+    # Do NOT hard-cap here — the firmware truncates per rotation (~26 chars in
+    # landscape, ~14 in portrait). A 14-char cap here chopped "rain 27min left"
+    # to "rain 27min lef" on the wide screen. Send the full text; let the board size it.
+    l1 = s["head"].replace("GO \u00b7 ", "").replace("WAIT \u00b7 ", "")
+    l2 = (s["sub"] or "")
+    body = json.dumps({"state": st, "line1": l1, "line2": l2, "who": "PIGS"}).encode()
+    cache = Path.home() / ".ranger-memory/config/rangerpuck.ip"
+    host = cache.read_text().strip() if cache.exists() else "rangerpuck.local"
+    endpoint = "/state" if st == "PIGSOON" else "/pig"   # SOON interrupts, else ambient
+    for h in (host, "rangerpuck.local"):
+        try:
+            req = urllib.request.Request(f"http://{h}{endpoint}", data=body,
+                                         headers={"Content-Type": "application/json"})
+            urllib.request.urlopen(req, timeout=3).read(); break
+        except Exception:
+            continue
     return st, l1, l2
 
 
