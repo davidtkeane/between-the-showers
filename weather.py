@@ -472,11 +472,117 @@ def report(push=False, gaps_only=False):
                     "check the hutch")
     print()
 
+# ─── THE PIG RUN ────────────────────────────────────────────────────────────
+# The most useful thing this whole tool does. David has to walk a few hundred
+# yards to the guinea pigs, feed them and spend ~half an hour checking them —
+# call it a 45-minute round trip. The question is never "will it rain today", it
+# is "do I have a long-enough DRY GAP right now to do the run and get back".
+#
+# Two data horizons, stitched together:
+#   0-60 min : OpenWeather minute nowcast (rain_minutes) — sharp, radar-grade
+#   60 min+  : Met Eireann hourly dry_gaps() — for planning ahead
+def pig_run(run_min=45):
+    """Returns a dict the terminal AND the puck can render. status is GO or WAIT."""
+    now = datetime.now(timezone.utc)
+    rm = rain_minutes()                     # None | ('dry',N) | ('rain',start,stop)
+    try:
+        inst, per = forecast(); rows = hourly(inst, per, 48)
+    except Exception:
+        rows = []
+    gaps = dry_gaps(rows) if rows else []
+
+    def gap_bounds(g): return g[0]["t"], g[-1]["t"] + timedelta(hours=1)
+    def hourly_dry_left():                  # dry minutes left in the hourly gap we're in
+        for g in gaps:
+            s, e = gap_bounds(g)
+            if s <= now < e: return int((e - now).total_seconds() // 60)
+        return 0
+    def next_gap():                         # next gap >= run_min starting after now
+        for g in gaps:
+            s, e = gap_bounds(g)
+            if s > now and (e - s).total_seconds() // 60 >= run_min:
+                return s.astimezone(), int((e - s).total_seconds() // 60)
+        return None, None
+
+    rise, sett = sun_times(LAT, LON)
+    dark_in = int((sett - now).total_seconds() // 60) if sett and sett > now else -1
+
+    st = dict(status="WAIT", head="", sub="", rain_left=None, dry_left=None,
+              next_at=None, next_len=None, dark_in=dark_in, run_min=run_min)
+
+    # --- decide -------------------------------------------------------------
+    if rm and rm[0] == "rain" and rm[1] == 0:
+        # raining right now
+        st["rain_left"] = rm[2]
+        left = f"{rm[2]}+min" if rm[2] >= 60 else f"{rm[2]}min"
+        st.update(status="WAIT", head=f"WAIT · rain {left} left")
+        na, nl = next_gap()
+        if na: st.update(next_at=na, next_len=nl, sub=f"next GO {na:%H:%M} ({nl//60}h{nl%60:02d})")
+        else:  st["sub"] = "no clear window in forecast"
+    elif rm and rm[0] == "rain" and rm[1] > 0:
+        # dry now, rain starts in rm[1] min
+        st["dry_left"] = rm[1]
+        if rm[1] >= run_min:
+            st.update(status="GO", head=f"GO · dry {rm[1]}min", sub=f"rain after that ({rm[2]-rm[1]}min shower)")
+        else:
+            st.update(status="WAIT", head=f"WAIT · rain in {rm[1]}min",
+                      sub=f"only {rm[1]}m dry, need {run_min}m")
+    else:
+        # dry now (minute says dry, or no minute data → trust hourly)
+        minute_dry = rm[1] if (rm and rm[0] == "dry") else 0
+        dry_left = max(minute_dry, hourly_dry_left())
+        st["dry_left"] = dry_left
+        if dry_left >= run_min:
+            disp = f"{dry_left//60}h{dry_left%60:02d}" if dry_left >= 60 else f"{dry_left}min"
+            st.update(status="GO", head=f"GO · dry {disp}")
+        else:
+            st.update(status="WAIT", head=f"WAIT · dry only {dry_left}min")
+            na, nl = next_gap()
+            if na: st.update(next_at=na, next_len=nl, sub=f"next GO {na:%H:%M}")
+
+    # darkness note — a 45-min run into the dark needs a torch
+    if st["status"] == "GO" and 0 <= dark_in <= run_min:
+        st["sub"] = (st["sub"] + " · " if st["sub"] else "") + f"DARK in {dark_in}min — torch"
+    return st
+
+def print_pig_run(run_min=45):
+    s = pig_run(run_min)
+    col = C['g'] if s["status"] == "GO" else C['r']
+    icon = "🟢" if s["status"] == "GO" else "🔴"
+    print(f"\n  {icon} {C['B']}{col}PIG RUN: {s['head']}{C['N']}  {C['d']}(run = {run_min}min){C['N']}")
+    if s["sub"]: print(f"     {C['d']}{s['sub']}{C['N']}")
+    print()
+
+
+def pig_push(run_min=45):
+    """Compute the pig-run status and push the matching state to the puck. One-shot,
+    called by launchd every few minutes. GO=green, WAIT=red, SOON=pulsing red."""
+    s = pig_run(run_min)
+    if s["status"] == "GO":
+        st = "PIGGO"
+    elif s.get("dry_left") is not None and 0 < s["dry_left"] <= 10:
+        st = "PIGSOON"                       # dry now, rain within 10 min — the flash
+    else:
+        st = "PIGWAIT"
+    l1 = s["head"].replace("GO \u00b7 ", "").replace("WAIT \u00b7 ", "")[:14]
+    l2 = (s["sub"] or "")[:20]
+    send = str(Path.home() / "esp32-projects/1-ranger-puck/tools/send.sh")
+    if os.path.exists(send):
+        env = dict(os.environ, PUCK_WHO="PIGS")
+        subprocess.Popen([send, st, l1, l2], env=env,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return st, l1, l2
+
+
 if __name__ == "__main__":
     if "--watch" in sys.argv:
         while True:
             try: report(push=True)
             except Exception as e: print(f"  error: {e}")
             time.sleep(600)
+    elif "--pigrun" in sys.argv or "--pig" in sys.argv:
+        print_pig_run(45)
+    elif "--pigpush" in sys.argv:
+        st, l1, l2 = pig_push(45); print(f"  pushed {st}: {l1} | {l2}")
     else:
         report(push="--puck" in sys.argv, gaps_only="--gaps" in sys.argv)
